@@ -1,2 +1,282 @@
+다음 코드를 구글 코랩 환경에서 실행시키는 상태에서 링크를 만들 수 있습니다.
 
- https://2a7609206ceaf85682.gradio.live
+# @title 🚀 기업 추천 AI 시스템 데모 실행하기
+# 먼저 이 셀을 실행하여 필요한 라이브러리를 설치하고 앱을 시작하세요.
+
+# 1. 환경 설정 및 라이브러리 설치
+import sys
+import subprocess
+import os
+
+def install_packages():
+    print("⏳ 필요한 라이브러리를 설치 중입니다...")
+    packages = ["gradio", "transformers", "torch", "pandas", "numpy", "scikit-learn", "openpyxl"]
+    for package in packages:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+    print("✅ 설치 완료!")
+
+# 라이브러리 존재 여부 확인 후 필요한 경우 설치
+try:
+    import gradio as gr
+    from transformers import AutoTokenizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except ImportError:
+    install_packages()
+
+# 2. 라이브러리 임포트 (설치 여부와 관계없이 항상 실행)
+import gradio as gr
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoTokenizer, AutoModel
+
+# ========================================================================================
+# [Model Architecture] 모델 클래스 (학습 코드와 동일 유지)
+# ========================================================================================
+class ReviewRatingRegressor(nn.Module):
+    def __init__(self, n_targets=6):
+        super(ReviewRatingRegressor, self).__init__()
+        self.bert = AutoModel.from_pretrained('klue/bert-base')
+        self.drop = nn.Dropout(p=0.3)
+        self.out = nn.Linear(self.bert.config.hidden_size, n_targets)
+
+    def forward(self, input_ids, attention_mask):
+        _, pooler_output = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=False
+        )
+        output = self.drop(pooler_output)
+        return self.out(output), pooler_output
+
+# ========================================================================================
+# [Preprocessing] 전처리 함수
+# ========================================================================================
+def local_preprocess_dataframe(df):
+    df.columns = [str(col).strip() for col in df.columns]
+    rename_map = {
+        '구분': 'job_role', '기업명': 'company',
+        '복지 및 급여': 'salary', '업무와 삶의 균형': 'wlb', '사내문화': 'culture',
+        '경영진': 'leadership', '승진 기회': 'promotion', '종합평점': 'overall'
+    }
+    available_cols = set(df.columns)
+    valid_rename = {k:v for k,v in rename_map.items() if k in available_cols}
+    df = df.rename(columns=valid_rename)
+
+    # 텍스트 결합
+    df['full_text'] = (
+        df['장점'].fillna('').astype(str) + " " +
+        df['단점'].fillna('').astype(str) + " " +
+        df['요약'].fillna('').astype(str)
+    )
+    return df
+
+# ========================================================================================
+# [Inference Class] 추천 시스템 로직 (Gradio용 수정 포함)
+# ========================================================================================
+class AIRecommender:
+    def __init__(self, model_path, data_path):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"[System] 사용 디바이스: {self.device}")
+
+        self.tokenizer = AutoTokenizer.from_pretrained('klue/bert-base')
+        
+        # 모델 로드
+        self.model = ReviewRatingRegressor(n_targets=6)
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"❌ 모델 파일({model_path})을 찾을 수 없습니다. 파일을 업로드 해주세요.")
+        
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.to(self.device)
+        self.model.eval()
+
+        # 데이터 로드
+        self.data_path = data_path
+        self.df = self._load_and_preprocess_data()
+        
+        # 임베딩 생성 (캐싱)
+        print("[System] 데이터 임베딩 생성 중... (잠시만 기다려주세요)")
+        self.company_embeddings = self._get_embeddings(self.df['full_text'].tolist())
+        print("[System] 준비 완료!")
+
+    def _load_and_preprocess_data(self):
+        if not os.path.exists(self.data_path):
+            raise FileNotFoundError(f"❌ 데이터 파일({self.data_path})을 찾을 수 없습니다.")
+        
+        try:
+            if self.data_path.endswith('.csv'):
+                df = pd.read_csv(self.data_path)
+            else:
+                df = pd.read_excel(self.data_path)
+        except Exception as e:
+            # CSV/Excel 호환성 재시도
+            try:
+                df = pd.read_csv(self.data_path)
+            except:
+                df = pd.read_excel(self.data_path)
+        
+        return local_preprocess_dataframe(df)
+
+    def _get_embeddings(self, text_list):
+        embeddings = []
+        batch_size = 16 # 코랩 메모리 고려하여 조절
+        
+        with torch.no_grad():
+            for i in range(0, len(text_list), batch_size):
+                batch_texts = text_list[i:i+batch_size]
+                encoded = self.tokenizer.batch_encode_plus(
+                    batch_texts, max_length=128, padding='max_length', truncation=True, return_tensors='pt'
+                )
+                input_ids = encoded['input_ids'].to(self.device)
+                mask = encoded['attention_mask'].to(self.device)
+                _, pooler_output = self.model(input_ids, mask)
+                embeddings.append(pooler_output.cpu().numpy())
+        return np.vstack(embeddings)
+
+    # Gradio용 추천 함수: DataFrame 반환
+    def recommend_for_ui(self, user_query, top_k=5):
+        # 쿼리 임베딩 생성
+        query_vec = self._get_embeddings([user_query])
+        
+        # 코사인 유사도 계산
+        sim_scores = cosine_similarity(query_vec, self.company_embeddings).flatten()
+        
+        # 상위 K개 추출
+        top_indices = sim_scores.argsort()[-top_k:][::-1]
+
+        results = []
+        for idx in top_indices:
+            row = self.df.iloc[idx]
+            results.append({
+                "순위": len(results) + 1,
+                "기업명": row.get('company', 'Unknown'),
+                "직무": row.get('job_role', '-'),
+                "AI 적합도": f"{sim_scores[idx]:.4f}",
+                "실제 평점": row.get('overall', 0.0),
+                "리뷰 요약": str(row.get('요약', ''))[:100] + "..."
+            })
+        return pd.DataFrame(results)
+
+    # Gradio용 예측 함수: Dictionary 반환
+    def analyze_review(self, text):
+        encoded = self.tokenizer.encode_plus(
+            text, max_length=128, padding='max_length', truncation=True, return_tensors='pt'
+        )
+        input_ids = encoded['input_ids'].to(self.device)
+        mask = encoded['attention_mask'].to(self.device)
+
+        with torch.no_grad():
+            scores, _ = self.model(input_ids, mask)
+            scores = scores.cpu().numpy()[0]
+        
+        labels = ['복지/급여', '워라밸', '사내문화', '경영진', '승진기회', '종합평점']
+        # 5점 만점 클리핑
+        scores = np.clip(scores, 0, 5)
+        return {label: float(score) for label, score in zip(labels, scores)}
+
+# ========================================================================================
+# [Gradio UI] 웹 인터페이스 구성
+# ========================================================================================
+
+# 전역 변수 설정 (시스템 로딩 상태 관리)
+recommender_system = None
+
+def load_system():
+    global recommender_system
+    # 코랩 기본 경로 설정
+    model_path = '/content/review_rating_model.pt'
+    data_path = '/content/통합_리뷰_기업중복제거.xlsx'
+    
+    # 파일 확인
+    if not os.path.exists(model_path) or not os.path.exists(data_path):
+        return "⚠️ 파일이 없습니다. 좌측 파일 메뉴에 'review_rating_model.pt'와 '통합_리뷰_기업중복제거.xlsx'를 업로드해주세요."
+    
+    try:
+        if recommender_system is None:
+            recommender_system = AIRecommender(model_path, data_path)
+        return "✅ 시스템 로드 완료! 이제 추천 기능을 사용할 수 있습니다."
+    except Exception as e:
+        return f"❌ 오류 발생: {str(e)}"
+
+def get_recommendation(query):
+    if recommender_system is None:
+        return pd.DataFrame({"오류": ["시스템이 로드되지 않았습니다. 상단의 '시스템 시작하기' 버튼을 눌러주세요."]})
+    return recommender_system.recommend_for_ui(query, top_k=5)
+
+def get_analysis(review_text):
+    if recommender_system is None:
+        return {"오류": 0}
+    return recommender_system.analyze_review(review_text)
+
+# 테마 및 UI 스타일 설정
+theme = gr.themes.Soft(
+    primary_hue="indigo",
+    secondary_hue="blue",
+).set(
+    button_primary_background_fill="*primary_500",
+    button_primary_background_fill_hover="*primary_600",
+)
+
+with gr.Blocks(theme=theme, title="AI 기업 추천 서비스") as demo:
+    gr.Markdown(
+        """
+        # 🏢 AI Enterprise Recommender
+        **AI가 당신의 성향을 분석하여 딱 맞는 기업을 추천해 드립니다.**
+        *(BERT 기반 딥러닝 모델 적용)*
+        """
+    )
+    
+    with gr.Row():
+        load_btn = gr.Button("🔄 시스템 시작하기 (파일 업로드 후 클릭)", variant="secondary")
+        system_status = gr.Textbox(label="시스템 상태", value="대기 중...", interactive=False)
+    
+    load_btn.click(load_system, inputs=None, outputs=system_status)
+
+    with gr.Tabs():
+        # [Tab 1] 기업 추천
+        with gr.TabItem("🔍 기업 추천 받기"):
+            gr.Markdown("원하는 회사의 분위기, 조건 등을 자연어로 입력하세요.")
+            with gr.Row():
+                with gr.Column(scale=4):
+                    query_input = gr.Textbox(
+                        placeholder="예: 연봉은 적어도 되니 워라밸이 확실하고 수평적인 문화가 있는 곳",
+                        label="나의 선호 조건",
+                        lines=2
+                    )
+                with gr.Column(scale=1):
+                    rec_btn = gr.Button("추천 검색", variant="primary", size="lg")
+            
+            rec_output = gr.Dataframe(
+                headers=["순위", "기업명", "직무", "AI 적합도", "실제 평점", "리뷰 요약"],
+                label="추천 결과",
+                wrap=True
+            )
+            
+            rec_btn.click(get_recommendation, inputs=query_input, outputs=rec_output)
+            query_input.submit(get_recommendation, inputs=query_input, outputs=rec_output) # 엔터키 지원
+
+        # [Tab 2] 리뷰 분석 (보너스 기능)
+        with gr.TabItem("📊 리뷰 점수 예측"):
+            gr.Markdown("작성한 리뷰가 AI에게 몇 점으로 평가받을지 예측해 봅니다.")
+            review_input = gr.Textbox(
+                placeholder="예: 경영진이 소통을 안 하고 야근이 너무 많습니다.",
+                label="기업 리뷰 입력",
+                lines=3
+            )
+            analyze_btn = gr.Button("점수 예측", variant="primary")
+            analysis_output = gr.Label(label="AI 예측 점수 (항목별)", num_top_classes=6)
+            
+            analyze_btn.click(get_analysis, inputs=review_input, outputs=analysis_output)
+
+    gr.Markdown("--- \n *Powered by Google Colab & Gradio*")
+
+# 실행 (share=True로 외부 링크 생성)
+if __name__ == "__main__":
+    print("웹 인터페이스를 시작합니다...")
+    demo.launch(share=True, debug=True)
+
+다음과 같은 UI가 간단하게 구현됩니다.
+
+
