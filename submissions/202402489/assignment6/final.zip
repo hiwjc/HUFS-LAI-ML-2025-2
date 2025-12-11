@@ -1,0 +1,581 @@
+# 학습할때 사용한 리뷰 파일을 훈련 데이터셋과 평가 데이터셋으로 분리하고, 학습하는 과정이 담긴 과정이 필요합니다. 평가에서 가장 높은 성능을 가진 모델을 가져온 뒤 실제 서비스에서 inference를 해야 합니다.
+
+import pandas as pd
+from sklearn.model_selection import train_test_split
+import os
+
+# ========================================================================================
+# [설정] 파일 경로 및 비율
+# ========================================================================================
+CONFIG = {
+    'input_file': '통합_리뷰_기업중복제거.xlsx', # 엑셀 파일명으로 수정
+    'train_ratio': 0.8,
+    'val_ratio': 0.1,
+    'test_ratio': 0.1,
+    'seed': 42 # 랜덤 시드 고정 (언제 실행해도 똑같이 섞이도록)
+}
+
+def split_and_save_dataset():
+    # 1. 원본 데이터 로드
+    if not os.path.exists(CONFIG['input_file']):
+        print(f"❌ 오류: '{CONFIG['input_file']}' 파일을 찾을 수 없습니다.")
+        print("   (코랩의 좌측 파일 탭에 엑셀 파일을 업로드했는지 확인해주세요.)")
+        return
+
+    print(f"📂 원본 데이터 로딩 중... ({CONFIG['input_file']})")
+
+    try:
+        # [수정] read_csv -> read_excel 변경
+        df = pd.read_excel(CONFIG['input_file'])
+    except Exception as e:
+        print(f"❌ 엑셀 파일을 읽는 도중 오류가 발생했습니다: {e}")
+        return
+
+    total_len = len(df)
+    print(f" -> 전체 데이터 수: {total_len}개")
+
+    # 2. 데이터 셔플 및 분할 (8:1:1)
+    # 먼저 Train(80%) vs Temp(20%)로 나눕니다.
+    train_df, temp_df = train_test_split(
+        df,
+        test_size=(1 - CONFIG['train_ratio']),
+        random_state=CONFIG['seed'],
+        shuffle=True # 무작위 섞기 필수
+    )
+
+    # 남은 Temp(20%)를 절반으로 나누어 Val(10%) vs Test(10%)로 만듭니다.
+    # (temp_df 내에서의 0.5는 전체의 0.1이 됩니다)
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=0.5,
+        random_state=CONFIG['seed'],
+        shuffle=True
+    )
+
+    # 3. 분할 결과 확인
+    print("\n📊 데이터 분할 결과")
+    print("-" * 30)
+    print(f"1️⃣ Train Set (학습) : {len(train_df)}개 ({len(train_df)/total_len*100:.1f}%)")
+    print(f"2️⃣ Valid Set (검증) : {len(val_df)}개 ({len(val_df)/total_len*100:.1f}%)")
+    print(f"3️⃣ Test Set  (평가) : {len(test_df)}개 ({len(test_df)/total_len*100:.1f}%)")
+    print("-" * 30)
+    print(f"합계 : {len(train_df) + len(val_df) + len(test_df)}개")
+
+    # 4. 파일로 저장
+    print("\n💾 파일 저장 중...")
+    # 학습/평가용 데이터는 호환성이 좋은 CSV로 저장합니다.
+    train_df.to_csv('train.csv', index=False, encoding='utf-8-sig')
+    val_df.to_csv('val.csv', index=False, encoding='utf-8-sig')
+    test_df.to_csv('test.csv', index=False, encoding='utf-8-sig')
+
+    print("✅ 저장 완료! 다음 파일들이 생성되었습니다:")
+    print("   - train.csv")
+    print("   - val.csv")
+    print("   - test.csv")
+
+if __name__ == "__main__":
+    split_and_save_dataset()
+
+###
+
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
+import numpy as np
+import pandas as pd # pandas 추가
+from torch.utils.data import Dataset, DataLoader # Dataset, DataLoader 추가
+from sklearn.metrics import mean_absolute_error, r2_score
+import os
+
+# ========================================================================================
+# [Data Loader Section] 데이터 로드 및 전처리 클래스 (통합됨)
+# ========================================================================================
+
+# 데이터 설정 (data_loader.py 내용을 여기로 가져옴)
+DATA_CONFIG = {
+    'model_name': 'klue/bert-base',
+    'max_len': 128,
+    'batch_size': 16,
+    'train_file': 'train.csv',
+    'val_file': 'val.csv',
+    'test_file': 'test.csv',
+}
+
+class ReviewDataset(Dataset):
+    def __init__(self, texts, targets, tokenizer, max_len):
+        self.texts = texts
+        self.targets = targets
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, item):
+        text = str(self.texts[item])
+        target = self.targets[item]
+
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+
+        return {
+            'review_text': text,
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'targets': torch.tensor(target, dtype=torch.float)
+        }
+
+def preprocess_dataframe(df):
+    """CSV 데이터 전처리 함수"""
+    df.columns = [str(col).strip() for col in df.columns]
+
+    rename_map = {
+        '구분': 'job_role', '기업명': 'company',
+        '복지 및 급여': 'salary', '업무와 삶의 균형': 'wlb', '사내문화': 'culture',
+        '경영진': 'leadership', '승진 기회': 'promotion', '종합평점': 'overall'
+    }
+    available_cols = set(df.columns)
+    valid_rename = {k:v for k,v in rename_map.items() if k in available_cols}
+    df = df.rename(columns=valid_rename)
+
+    df['full_text'] = (
+        df['장점'].fillna('').astype(str) + " " +
+        df['단점'].fillna('').astype(str) + " " +
+        df['요약'].fillna('').astype(str)
+    )
+
+    target_cols = ['salary', 'wlb', 'culture', 'leadership', 'promotion', 'overall']
+    for col in target_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(3.0)
+
+    valid_target_cols = [col for col in target_cols if col in df.columns]
+    return df, valid_target_cols
+
+def get_data_loaders():
+    """데이터셋 파일을 로드하여 DataLoader 생성"""
+    print("\n[Data Loader] CSV 파일 로드 시작...")
+
+    # 파일 경로 확인
+    files = {
+        'Train': DATA_CONFIG['train_file'],
+        'Val': DATA_CONFIG['val_file'],
+        'Test': DATA_CONFIG['test_file']
+    }
+
+    for name, path in files.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"❌ '{path}' 파일이 없습니다. dataset_splitter.py를 먼저 실행하거나 파일을 업로드해주세요.")
+
+    df_train = pd.read_csv(files['Train'])
+    df_val = pd.read_csv(files['Val'])
+    df_test = pd.read_csv(files['Test'])
+
+    df_train, target_cols = preprocess_dataframe(df_train)
+    df_val, _ = preprocess_dataframe(df_val)
+    df_test, _ = preprocess_dataframe(df_test)
+
+    tokenizer = AutoTokenizer.from_pretrained(DATA_CONFIG['model_name'])
+
+    def create_loader(df):
+        ds = ReviewDataset(
+            texts=df['full_text'].to_numpy(),
+            targets=df[target_cols].to_numpy(),
+            tokenizer=tokenizer,
+            max_len=DATA_CONFIG['max_len']
+        )
+        return DataLoader(ds, batch_size=DATA_CONFIG['batch_size'], num_workers=0)
+
+    return create_loader(df_train), create_loader(df_val), create_loader(df_test), target_cols, tokenizer
+
+
+# ========================================================================================
+# [설정] 학습 하이퍼파라미터
+# ========================================================================================
+TRAIN_CONFIG = {
+    'epochs': 5,             # 학습 반복 횟수
+    'learning_rate': 2e-5,   # 학습률
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'model_save_path': 'review_rating_model.pt' # 학습된 모델 저장 경로
+}
+
+# ========================================================================================
+# [Model Architecture] BERT Regressor
+# ========================================================================================
+class ReviewRatingRegressor(nn.Module):
+    def __init__(self, n_targets=6):
+        super(ReviewRatingRegressor, self).__init__()
+        # DATA_CONFIG를 직접 참조
+        self.bert = AutoModel.from_pretrained(DATA_CONFIG['model_name'])
+        self.drop = nn.Dropout(p=0.3)
+        self.out = nn.Linear(self.bert.config.hidden_size, n_targets)
+
+    def forward(self, input_ids, attention_mask):
+        _, pooler_output = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=False
+        )
+        output = self.drop(pooler_output)
+        return self.out(output), pooler_output
+
+# ========================================================================================
+# [Training & Evaluation Steps]
+# ========================================================================================
+def train_step(model, data_loader, loss_fn, optimizer, scheduler, device):
+    model = model.train()
+    losses = []
+
+    for d in data_loader:
+        input_ids = d["input_ids"].to(device)
+        attention_mask = d["attention_mask"].to(device)
+        targets = d["targets"].to(device)
+
+        outputs, _ = model(input_ids=input_ids, attention_mask=attention_mask)
+        loss = loss_fn(outputs, targets)
+
+        losses.append(loss.item())
+        loss.backward()
+
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+    return np.mean(losses)
+
+def eval_step(model, data_loader, loss_fn, device):
+    model = model.eval()
+    losses = []
+
+    with torch.no_grad():
+        for d in data_loader:
+            input_ids = d["input_ids"].to(device)
+            attention_mask = d["attention_mask"].to(device)
+            targets = d["targets"].to(device)
+
+            outputs, _ = model(input_ids=input_ids, attention_mask=attention_mask)
+            loss = loss_fn(outputs, targets)
+            losses.append(loss.item())
+
+    return np.mean(losses)
+
+# ========================================================================================
+# [Main Execution Flow]
+# ========================================================================================
+def run_training():
+    print("="*60)
+    print("🚀 리뷰 평점 예측 모델 학습 시작")
+    print("="*60)
+
+    # 1. 데이터 로드 (내부 함수 호출)
+    train_loader, val_loader, test_loader, target_cols, _ = get_data_loaders()
+
+    # 2. 모델 초기화
+    device = TRAIN_CONFIG['device']
+    print(f"\n[Setup] Device: {device}")
+    model = ReviewRatingRegressor(n_targets=len(target_cols)).to(device)
+
+    # 3. Optimizer & Scheduler 설정
+    optimizer = AdamW(model.parameters(), lr=TRAIN_CONFIG['learning_rate'])
+    total_steps = len(train_loader) * TRAIN_CONFIG['epochs']
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+
+    loss_fn = nn.MSELoss().to(device)
+
+    # 4. 학습 루프 (Training Loop)
+    print("\n[Training Process]")
+    best_loss = float('inf')
+
+    for epoch in range(TRAIN_CONFIG['epochs']):
+        train_loss = train_step(model, train_loader, loss_fn, optimizer, scheduler, device)
+        val_loss = eval_step(model, val_loader, loss_fn, device)
+
+        print(f"Epoch {epoch+1}/{TRAIN_CONFIG['epochs']} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+        if val_loss < best_loss:
+            torch.save(model.state_dict(), TRAIN_CONFIG['model_save_path'])
+            best_loss = val_loss
+            print(f"   ✅ Best Model Saved! (Val Loss: {best_loss:.4f})")
+
+    # 5. 최종 평가 (Test Set Evaluation)
+    print("\n" + "="*60)
+    print("🏆 최종 모델 평가 (Test Set)")
+    print("="*60)
+
+    if os.path.exists(TRAIN_CONFIG['model_save_path']):
+        model.load_state_dict(torch.load(TRAIN_CONFIG['model_save_path']))
+        print(" -> 학습 중 저장된 최고의 모델 가중치를 로드했습니다.")
+    else:
+        print(" -> 저장된 모델이 없어 마지막 에포크 모델로 평가합니다.")
+
+    model.eval()
+
+    preds, reals = [], []
+    with torch.no_grad():
+        for d in test_loader:
+            input_ids = d["input_ids"].to(device)
+            attention_mask = d["attention_mask"].to(device)
+            targets = d["targets"].to(device)
+
+            outputs, _ = model(input_ids=input_ids, attention_mask=attention_mask)
+
+            preds.extend(outputs.cpu().numpy())
+            reals.extend(targets.cpu().numpy())
+
+    preds = np.array(preds)
+    reals = np.array(reals)
+
+    mae = mean_absolute_error(reals, preds)
+    r2 = r2_score(reals, preds)
+
+    print(f"\n📊 Test 결과 요약:")
+    print(f"   - MAE (평균 오차) : {mae:.4f} (낮을수록 좋음)")
+    print(f"   - R2 Score (결정계수): {r2:.4f} (1에 가까울수록 좋음)")
+
+    print("\n[💡 해석]")
+    print(f"   이 모델은 사용자의 리뷰 텍스트만 보고 실제 평점과 평균 {mae:.2f}점 차이로 예측하고 있습니다.")
+
+if __name__ == "__main__":
+    run_training()
+
+# 가장 성능이 좋은 모델로 판단되는 모델에 대한 정보를 .pt 파일로 저장되어 다음 최종 직무 추천 알고리즘에서 사용될 수 있도록 합니다 이 과정에서 필요한 원본 파일은 데이터 분석 단계인 과제 3에 첨부된 기업 리뷰 파일을 이요하시면 됩니다.
+
+import torch
+import torch.nn as nn  # nn 모듈 추가
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoTokenizer, AutoModel  # AutoModel 추가
+import os
+
+# ========================================================================================
+# [Model Architecture] 독립 실행을 위해 모델 클래스 직접 정의
+# ========================================================================================
+class ReviewRatingRegressor(nn.Module):
+    def __init__(self, n_targets=6):
+        super(ReviewRatingRegressor, self).__init__()
+        self.bert = AutoModel.from_pretrained('klue/bert-base') # 모델명 하드코딩 (학습과 동일)
+        self.drop = nn.Dropout(p=0.3)
+        self.out = nn.Linear(self.bert.config.hidden_size, n_targets)
+
+    def forward(self, input_ids, attention_mask):
+        _, pooler_output = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=False
+        )
+        output = self.drop(pooler_output)
+        return self.out(output), pooler_output
+
+# ========================================================================================
+# [Preprocessing] 전처리 함수 직접 정의
+# ========================================================================================
+def local_preprocess_dataframe(df):
+    # 컬럼명 공백 제거
+    df.columns = [str(col).strip() for col in df.columns]
+
+    # 컬럼 매핑 (한글 -> 영문)
+    rename_map = {
+        '구분': 'job_role', '기업명': 'company',
+        '복지 및 급여': 'salary', '업무와 삶의 균형': 'wlb', '사내문화': 'culture',
+        '경영진': 'leadership', '승진 기회': 'promotion', '종합평점': 'overall'
+    }
+    available_cols = set(df.columns)
+    valid_rename = {k:v for k,v in rename_map.items() if k in available_cols}
+    df = df.rename(columns=valid_rename)
+
+    # 텍스트 결합 (장점 + 단점 + 요약 -> full_text)
+    df['full_text'] = (
+        df['장점'].fillna('').astype(str) + " " +
+        df['단점'].fillna('').astype(str) + " " +
+        df['요약'].fillna('').astype(str)
+    )
+    return df
+
+# ========================================================================================
+# [Inference Class] 추천 시스템
+# ========================================================================================
+class AIRecommender:
+    def __init__(self, model_path, data_path):
+        # 1. 디바이스 설정
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"[Inference] 사용 디바이스: {self.device}")
+
+        # 2. 토크나이저 로드
+        self.tokenizer = AutoTokenizer.from_pretrained('klue/bert-base')
+
+        # 3. 모델 아키텍처 로드 및 가중치 복원
+        try:
+            # train 모듈 의존성 제거 -> 내부 클래스 사용
+            self.model = ReviewRatingRegressor(n_targets=6)
+
+            # [수정] 코랩 경로 호환성 강화
+            if not os.path.exists(model_path):
+                 # 만약 입력된 경로에 없으면 코랩 기본 경로 확인
+                if os.path.exists('/content/review_rating_model.pt'):
+                    print(f"⚠️ 지정된 경로({model_path})에 파일이 없어 '/content/review_rating_model.pt'를 대신 사용합니다.")
+                    model_path = '/content/review_rating_model.pt'
+
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            self.model.to(self.device)
+            self.model.eval()
+            print(f"✅ 학습된 모델 로드 완료! (경로: {model_path})")
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"❌ 모델 파일({model_path})을 찾을 수 없습니다. 학습 코드를 먼저 실행해 주세요.")
+
+        # 4. 추천 후보군 데이터 준비
+        self.data_path = data_path
+        self.df = self._load_and_preprocess_data()
+
+        # 5. 전체 데이터 임베딩 생성
+        print("\n[Inference] 전체 기업 데이터의 임베딩(Vector)을 생성 중입니다...")
+        self.company_embeddings = self._get_embeddings(self.df['full_text'].tolist())
+        print(f" -> 임베딩 생성 완료. (Shape: {self.company_embeddings.shape})")
+
+    def _load_and_preprocess_data(self):
+        # 1. 파일 존재 여부 및 경로 보정
+        if not os.path.exists(self.data_path):
+            # 코랩 환경 예외 처리: 엑셀 파일 우선 탐색
+            if os.path.exists('/content/통합_리뷰_기업중복제거.xlsx'):
+                 self.data_path = '/content/통합_리뷰_기업중복제거.xlsx'
+            # CSV 파일 (변환된 것) 차선 탐색
+            elif os.path.exists('/content/통합_리뷰_기업중복제거.xlsx - Sheet1.csv'):
+                 self.data_path = '/content/통합_리뷰_기업중복제거.xlsx - Sheet1.csv'
+            else:
+                raise FileNotFoundError(f"데이터 파일({self.data_path})을 찾을 수 없습니다.")
+
+        print(f"[Inference] 데이터 로드 중... ({self.data_path})")
+
+        # 2. 확장자에 따른 로드 (Excel vs CSV)
+        if self.data_path.endswith('.xlsx') or self.data_path.endswith('.xls'):
+            try:
+                df = pd.read_excel(self.data_path)
+            except Exception as e:
+                raise ValueError(f"엑셀 파일을 읽는 중 오류가 발생했습니다. (openpyxl 설치 확인 필요): {e}")
+        else:
+            # CSV로 시도하되 실패하면 Excel로 재시도 (확장자가 잘못된 경우 대비)
+            try:
+                df = pd.read_csv(self.data_path)
+            except:
+                try:
+                    df = pd.read_excel(self.data_path)
+                except Exception as e:
+                    raise ValueError(f"파일을 읽을 수 없습니다: {e}")
+
+        # 내부 전처리 함수 사용
+        df = local_preprocess_dataframe(df)
+        return df
+
+    def _get_embeddings(self, text_list):
+        embeddings = []
+        batch_size = 32
+
+        with torch.no_grad():
+            for i in range(0, len(text_list), batch_size):
+                batch_texts = text_list[i:i+batch_size]
+
+                encoded = self.tokenizer.batch_encode_plus(
+                    batch_texts,
+                    max_length=128,
+                    padding='max_length',
+                    truncation=True,
+                    return_tensors='pt'
+                )
+
+                input_ids = encoded['input_ids'].to(self.device)
+                mask = encoded['attention_mask'].to(self.device)
+
+                # 모델 통과 -> 임베딩 추출
+                _, pooler_output = self.model(input_ids, mask)
+                embeddings.append(pooler_output.cpu().numpy())
+
+        return np.vstack(embeddings)
+
+    def recommend(self, user_query, top_k=3):
+        print(f"\n" + "="*60)
+        print(f"🔍 사용자 입력: '{user_query}'")
+        print("="*60)
+
+        query_vec = self._get_embeddings([user_query])
+        sim_scores = cosine_similarity(query_vec, self.company_embeddings).flatten()
+        top_indices = sim_scores.argsort()[-top_k:][::-1]
+
+        print(f"🤖 AI 추천 결과 (Top {top_k}):")
+
+        rank = 1
+        for idx in top_indices:
+            row = self.df.iloc[idx]
+            sim = sim_scores[idx]
+
+            c_name = row.get('company', 'Unknown')
+            role = row.get('job_role', 'Unknown')
+            rating = row.get('overall', 0.0)
+            summary = str(row.get('요약', ''))[:50] + "..."
+
+            print(f"\n[{rank}위] {c_name} ({role})")
+            print(f"   • 적합도(유사도): {sim:.4f}")
+            print(f"   • 실제 종합평점: {rating}점")
+            print(f"   • 리뷰 요약: {summary}")
+            rank += 1
+
+    def predict_score(self, text):
+        encoded = self.tokenizer.encode_plus(
+            text, max_length=128, padding='max_length', truncation=True, return_tensors='pt'
+        )
+        input_ids = encoded['input_ids'].to(self.device)
+        mask = encoded['attention_mask'].to(self.device)
+
+        with torch.no_grad():
+            scores, _ = self.model(input_ids, mask)
+            scores = scores.cpu().numpy()[0]
+
+        print(f"\n📊 '{text[:20]}...'에 대한 AI 평점 예측:")
+        labels = ['복지/급여', '워라밸', '문화', '경영진', '승진', '종합']
+        for label, score in zip(labels, scores):
+            print(f"   - {label}: {score:.2f}점")
+
+# ========================================================================================
+# [Main Execution] 실제 사용 예시
+# ========================================================================================
+if __name__ == "__main__":
+    # 데이터 경로: 코랩에 업로드된 엑셀 파일 우선 (/content/...)
+    target_data_path = '/content/통합_리뷰_기업중복제거.xlsx'
+
+    # 모델 경로: 코랩에 생성된 .pt 파일 경로
+    target_model_path = '/content/review_rating_model.pt'
+
+    if not os.path.exists(target_data_path) and not os.path.exists('/content/통합_리뷰_기업중복제거.xlsx - Sheet1.csv'):
+         print(f"⚠️ 데이터 파일을 찾을 수 없습니다. '{target_data_path}' 경로를 확인해주세요.")
+
+    try:
+        rec_system = AIRecommender(
+            model_path=target_model_path,
+            data_path=target_data_path
+        )
+
+        # --- 시나리오 테스트 ---
+        print("\n👇 [테스트 1] 워라밸 중시형")
+        rec_system.recommend("연봉은 적어도 되니까 야근 없고 수평적인 곳", top_k=3)
+
+        print("\n👇 [테스트 2] 성장/보상 중시형")
+        rec_system.recommend("일이 힘들어도 배울게 많고 성과급 확실한 곳", top_k=3)
+
+        # print("\n👇 [테스트 3] 점수 예측")
+        # rec_system.predict_score("야근이 매일 있고 주말 출근도 강요합니다. 연봉은 최저임금 수준.")
+
+    except Exception as e:
+        print(f"\n❌ 오류 발생: {e}")
+        print("1. 학습 코드를 먼저 실행하여 모델(pt 파일)을 생성했는지 확인하세요.")
+        print("2. 엑셀 데이터 파일(.xlsx)이 존재하는지 확인하세요.")
