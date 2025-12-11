@@ -10,7 +10,13 @@ review_rating_model.pt라는 이름 (성능이 가장 좋은 모델 정보)으�
 
 ** review_rating_model.pt의 경우 파일 형식 및 용량 문제로 업로드에 문제가 있었습니다
 
-demo_링크에 소개된 코드를 이용하여 구글 코랩 환경의 GPU 런타임 내 다음과 같은 실제 사용을 해볼 수 있습니다.
+demo_링크에 소개된 코드를 이용하여 구글 코랩 환경의 GPU 런타임 내 다음과 같은 실제 사용을 해볼 수 있습니다. 다음은 실사례 예시들입니다.
 
 <img width="1901" height="837" alt="image" src="https://github.com/user-attachments/assets/1e02d4f5-49ce-4088-86d2-f26df80e1677" />
+
+<img width="1891" height="530" alt="실사례 2" src="https://github.com/user-attachments/assets/d0f5cb9c-f470-4828-8f97-de167553f982" />
+
+<img width="1891" height="558" alt="실사례 3" src="https://github.com/user-attachments/assets/332010e8-65e5-423d-b049-641634d4ec66" />
+
+
 
