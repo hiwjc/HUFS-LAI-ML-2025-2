@@ -9,3 +9,8 @@ final_zip에 소개되어 있는 코드를 순차적으로 진행하시면 됩�
 review_rating_model.pt라는 이름 (성능이 가장 좋은 모델 정보)으로 저장해 놓았습니다.
 
 ** review_rating_model.pt의 경우 파일 형식 및 용량 문제로 업로드에 문제가 있었습니다
+
+demo_링크에 소개된 코드를 이용하여 구글 코랩 환경의 GPU 런타임 내 다음과 같은 실제 사용을 해볼 수 있습니다.
+
+<img width="1901" height="837" alt="image" src="https://github.com/user-attachments/assets/1e02d4f5-49ce-4088-86d2-f26df80e1677" />
+
